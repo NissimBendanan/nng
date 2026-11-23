@@ -166,6 +166,14 @@ ipc_recv(void *arg, nni_aio *aio)
 
 	nni_aio_reset(aio);
 	nni_mtx_lock(&c->mtx);
+	// Start the aio first: an aio that is finished without having been
+	// started loses its callback when it was stopped meanwhile (see
+	// nni_aio_finish_impl), and the caller, which waits for that callback
+	// to fail its own pending operations, then hangs forever.
+	if (!nni_aio_start(aio, ipc_recv_cancel, c)) {
+		nni_mtx_unlock(&c->mtx);
+		return;
+	}
 	if (c->closed) {
 		nni_mtx_unlock(&c->mtx);
 		nni_aio_finish_error(aio, NNG_ECLOSED);
@@ -175,10 +183,6 @@ ipc_recv(void *arg, nni_aio *aio)
 		int rv = c->recv_rv;
 		nni_mtx_unlock(&c->mtx);
 		nni_aio_finish_error(aio, rv);
-		return;
-	}
-	if (!nni_aio_start(aio, ipc_recv_cancel, c)) {
-		nni_mtx_unlock(&c->mtx);
 		return;
 	}
 	nni_list_append(&c->recv_aios, aio);
