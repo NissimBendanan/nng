@@ -53,6 +53,7 @@ struct pair0_sock {
 	nni_pollable writable;
 	bool         rd_ready; // pipe ready for read
 	bool         wr_ready; // pipe ready for write
+	bool         closed;   // set by pair0_sock_close, under mtx
 #ifdef NNG_ENABLE_STATS
 	nni_stat_item stat_already;
 #endif
@@ -235,6 +236,16 @@ pair0_pipe_recv_cb(void *arg)
 
 	nni_mtx_lock(&s->mtx);
 
+	// pair0_pipe_stop may have detached this pipe (s->p = NULL) while this
+	// callback was already running. Its message is no longer deliverable,
+	// and setting rd_ready now would make pair0_sock_recv use a NULL pipe.
+	if (s->p != p) {
+		nni_mtx_unlock(&s->mtx);
+		nni_aio_set_msg(&p->aio_recv, NULL);
+		nni_msg_free(msg);
+		return;
+	}
+
 	// if anyone is blocking, then the lmq will be empty, and
 	// we should deliver it there.
 	if ((a = nni_list_first(&s->raq)) != NULL) {
@@ -336,6 +347,10 @@ pair0_sock_close(void *arg)
 	nni_aio    *a;
 	nni_msg    *m;
 	nni_mtx_lock(&s->mtx);
+	// The socket stays reachable for nng_recvmsg/nng_sendmsg until
+	// nni_sock_close marks it closed. Operations arriving after this point
+	// must fail here, not wait in raq/waq of a socket that is being freed.
+	s->closed = true;
 	while (((a = nni_list_first(&s->raq)) != NULL) ||
 	    ((a = nni_list_first(&s->waq)) != NULL)) {
 		nni_aio_list_remove(a);
@@ -373,6 +388,11 @@ pair0_sock_send(void *arg, nni_aio *aio)
 	nni_sock_bump_tx(s->nsock, len);
 
 	nni_mtx_lock(&s->mtx);
+	if (s->closed) {
+		nni_mtx_unlock(&s->mtx);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+		return;
+	}
 	if (s->wr_ready) {
 		pair0_pipe *p = s->p;
 		if (nni_lmq_full(&s->wmq)) {
@@ -413,6 +433,11 @@ pair0_sock_recv(void *arg, nni_aio *aio)
 	nni_msg    *m;
 
 	nni_mtx_lock(&s->mtx);
+	if (s->closed) {
+		nni_mtx_unlock(&s->mtx);
+		nni_aio_finish_error(aio, NNG_ECLOSED);
+		return;
+	}
 	p = s->p;
 
 	// Buffered read.  If there is a message waiting for us, pick

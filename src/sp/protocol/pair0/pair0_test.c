@@ -472,6 +472,93 @@ test_pair0_poll_writable(void)
 	NUTS_CLOSE(s1);
 }
 
+// Closing a socket while another thread is receiving or sending on it must
+// not hang or crash.  Two races in pair0: an operation that arrived after
+// pair0_sock_close() had failed the queued ones was queued into the closing
+// socket and never finished (blocked forever; with a timeout, the timer
+// later touched the freed socket), and a receive callback for a pipe that
+// had just been detached marked a message ready without a pipe, so the
+// next receive used a NULL pipe.
+// Each round has a receiver and a sender that run without timeouts; the
+// receiver is closed while messages arrive, then the sender, and both
+// threads must finish.  A few workers run rounds in parallel.
+#define PAIR0_CLOSE_RACE_WORKERS 8
+#define PAIR0_CLOSE_RACE_ROUNDS 100
+#define PAIR0_CLOSE_RACE_SCHEME "inproc"
+
+static void
+pair0_close_race_send(void *arg)
+{
+	nng_socket *s = arg;
+	nng_msg    *m;
+
+	while (nng_msg_alloc(&m, 64) == 0) {
+		if (nng_sendmsg(*s, m, 0) != 0) {
+			nng_msg_free(m);
+			return;
+		}
+	}
+}
+
+static void
+pair0_close_race_recv(void *arg)
+{
+	nng_socket *s = arg;
+	nng_msg    *m;
+
+	while (nng_recvmsg(*s, &m, 0) == 0) {
+		nng_msg_free(m);
+	}
+}
+
+static void
+pair0_close_race_worker(void *arg)
+{
+	int *failed = arg;
+
+	for (int i = 0; i < PAIR0_CLOSE_RACE_ROUNDS; i++) {
+		nng_socket  rx;
+		nng_socket  tx;
+		nng_thread *rx_thr;
+		nng_thread *tx_thr;
+		char        addr[NNG_MAXADDRLEN];
+
+		// NUTS_ADDR uses a static buffer; the workers need their own.
+		nuts_scratch_addr(PAIR0_CLOSE_RACE_SCHEME, sizeof(addr), addr);
+		if ((nng_pair0_open(&rx) != 0) || (nng_pair0_open(&tx) != 0) ||
+		    (nng_listen(rx, addr, NULL, 0) != 0) ||
+		    (nng_dial(tx, addr, NULL, 0) != 0) ||
+		    (nng_thread_create(&rx_thr, pair0_close_race_recv, &rx) !=
+		        0) ||
+		    (nng_thread_create(&tx_thr, pair0_close_race_send, &tx) !=
+		        0)) {
+			(*failed)++;
+			return;
+		}
+		nng_msleep(nng_random() % 3);
+		nng_socket_close(rx);
+		nng_socket_close(tx);
+		nng_thread_destroy(rx_thr); // hangs here without the fix
+		nng_thread_destroy(tx_thr);
+	}
+}
+
+static void
+test_pair0_close_during_traffic(void)
+{
+	nng_thread *workers[PAIR0_CLOSE_RACE_WORKERS];
+	int         failed[PAIR0_CLOSE_RACE_WORKERS] = { 0 };
+
+	for (int i = 0; i < PAIR0_CLOSE_RACE_WORKERS; i++) {
+		NUTS_PASS(nng_thread_create(
+		    &workers[i], pair0_close_race_worker, &failed[i]));
+	}
+	for (int i = 0; i < PAIR0_CLOSE_RACE_WORKERS; i++) {
+		nng_thread_destroy(workers[i]);
+		NUTS_TRUE(failed[i] == 0);
+	}
+}
+
 NUTS_TESTS = {
 	{ "pair0 identity", test_identity },
 	{ "pair0 cooked", test_cooked },
@@ -490,6 +577,7 @@ NUTS_TESTS = {
 	{ "pair0 recv buffer", test_pair0_recv_buffer },
 	{ "pair0 poll readable", test_pair0_poll_readable },
 	{ "pair0 poll writable", test_pair0_poll_writable },
+	{ "pair0 close during traffic", test_pair0_close_during_traffic },
 
 	{ NULL, NULL },
 };
