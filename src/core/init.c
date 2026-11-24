@@ -205,3 +205,5 @@ nng_fini(void)
 	nni_strerror_sys_fini();
 	nni_atomic_flag_reset(&init_busy);
 }
+
+// ci baseline (fork only, do not merge)
